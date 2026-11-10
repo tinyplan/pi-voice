@@ -15,17 +15,11 @@ import {
  * it does not recognise and hands them back through `getUserBindings()`.
  *
  * Navigation, confirm, and cancel come from pi's `tui.*` ids. Tab is ours: it
- * continues the language step and browses from Your models. The model pickers
- * in between swallow the Continue key so the setup sequence never reads Tab as
- * "go back".
+ * continues the language step.
  */
 export const VOICE_KEYBINDINGS = {
   "voice.languages.toggle": { defaultKeys: "space", description: "Toggle the highlighted language" },
   "voice.languages.continue": { defaultKeys: "tab", description: "Continue with the selected languages" },
-  "voice.languages.change": { defaultKeys: "ctrl+l", description: "Change spoken languages" },
-  "voice.recommendations.browseAll": { defaultKeys: "o", description: "Browse all models" },
-  "voice.models.ratingsHelp": { defaultKeys: "?", description: "Open the rating guide" },
-  "voice.ratingsHelp.close": { defaultKeys: "q", description: "Close the rating guide" },
   "voice.scroll.top": { defaultKeys: "home", description: "Scroll to the top" },
   "voice.scroll.bottom": { defaultKeys: "end", description: "Scroll to the bottom" },
   "voice.tryIt.shortcut": { defaultKeys: "s", description: "Change the dictation shortcut" },

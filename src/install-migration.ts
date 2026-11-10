@@ -42,6 +42,6 @@ export function legacyGitMigrationMessage(sourceInfo: SourceInfo): string {
     "Pi Voice is still installed from the old pi-transcribe Git repository.",
     "For stable npm updates, replace it with the renamed package:",
     `pi remove${local} ${sourceInfo.source}`,
-    `pi install${local} npm:@earendil-works/pi-voice`,
+    `pi install${local} npm:@tinyplan/pi-voice`,
   ].join("\n");
 }

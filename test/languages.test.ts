@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { canonicalLanguage, languageIdentity, resolveModelLanguage } from "../src/languages.js";
+import { canonicalLanguage, displayLanguage, languageIdentity } from "../src/languages.js";
 
 test("language identities normalize case, regions, and aliases", () => {
   assert.equal(canonicalLanguage(" TL-ph "), "tl");
@@ -11,12 +11,9 @@ test("language identities normalize case, regions, and aliases", () => {
   assert.equal(languageIdentity("en-GB"), "en");
 });
 
-test("model resolution returns exact backend codes, preferring explicit regions", () => {
-  const model = { languages: ["en-US", "en-GB", "no", "tl", "zh"] };
-  assert.equal(resolveModelLanguage(model, "fil"), "tl");
-  assert.equal(resolveModelLanguage(model, "nb"), "no");
-  assert.equal(resolveModelLanguage(model, " EN-gb "), "en-GB");
-  assert.equal(resolveModelLanguage(model, "en"), "en-US");
-  assert.equal(resolveModelLanguage(model, "zh"), "zh");
-  assert.equal(resolveModelLanguage(model, "unknown"), undefined);
+test("language display names distinguish Mandarin and pass codes through", () => {
+  assert.equal(displayLanguage("zh"), "Mandarin (Chinese)");
+  assert.equal(displayLanguage("zh-CN"), "Mandarin (Chinese)");
+  assert.equal(displayLanguage("en"), "English");
+  assert.equal(displayLanguage("qzx"), "qzx");
 });

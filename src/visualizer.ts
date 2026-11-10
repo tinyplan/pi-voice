@@ -150,8 +150,6 @@ export function showReadyStatus(
   ]);
 }
 
-export type MeterModelState = "loading" | "ready" | "failed";
-
 /** Peak-hold band levels computed from capture chunks. */
 export class SpectrumAnalyzer {
   readonly bands: number[] = Array.from({ length: BAND_EDGES_HZ.length - 1 }, () => 0);
@@ -178,16 +176,15 @@ export class SpectrumAnalyzer {
 }
 
 /**
- * The one-line recording meter: band blocks, elapsed time, model state, and
- * an optional trailing hint. Every surface that shows a recording renders
- * through here so the editor widget and the setup pane look the same.
+ * The one-line recording meter: band blocks, elapsed time, and an optional
+ * trailing hint. Every surface that shows a recording renders through here
+ * so the editor widget and the setup pane look the same.
  */
 export function renderMeterLine(
   theme: UiTheme,
   options: {
     bands: readonly number[];
     elapsedMs: number;
-    modelState: MeterModelState;
     /** The microphone failed; what it captured is kept. */
     microphoneStopped?: boolean;
     /** Pre-styled key hints, as built by pi's `rawKeyHint`. */
@@ -198,8 +195,6 @@ export function renderMeterLine(
     theme.fg("accent", options.bands.map(blockForLevel).join("")),
     theme.fg("muted", formatElapsed(options.elapsedMs)),
   ];
-  if (options.modelState === "loading") parts.push(theme.fg("dim", "loading model"));
-  if (options.modelState === "failed") parts.push(theme.fg("warning", "model load failed"));
   if (options.microphoneStopped) parts.push(theme.fg("error", "microphone stopped"));
   if (options.hints) parts.push(options.hints);
   return parts.join("  ");
@@ -212,7 +207,6 @@ export class RecordingMeter {
   private nextPaintAt = 0;
   private lastLine: string | undefined;
   private ctx: ExtensionContext | undefined;
-  private modelState: MeterModelState = "loading";
   private microphoneStopped = false;
   private hints: string | undefined;
 
@@ -224,13 +218,11 @@ export class RecordingMeter {
     this.analyzer.reset();
     this.nextPaintAt = 0;
     this.lastLine = undefined;
-    this.modelState = "loading";
     this.microphoneStopped = false;
     this.paint();
   }
 
-  update(state: { modelState: MeterModelState; microphoneStopped: boolean }): void {
-    this.modelState = state.modelState;
+  update(state: { microphoneStopped: boolean }): void {
     this.microphoneStopped = state.microphoneStopped;
     this.paint();
   }
@@ -260,7 +252,6 @@ export class RecordingMeter {
     const line = renderMeterLine(ctx.ui.theme, {
       bands: this.analyzer.bands,
       elapsedMs: Date.now() - this.startedAt,
-      modelState: this.modelState,
       microphoneStopped: this.microphoneStopped,
       hints: this.hints,
     });

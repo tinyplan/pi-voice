@@ -3,22 +3,25 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
-import { downloadCatalogModel, pendingDownloads } from "./models.js";
+import {
+  apiKeyStatusMessage,
+  asrApiKey,
+  customAsrBaseUrl,
+  hasAsrCredentials,
+} from "./asr-client.js";
 import { microphonePermission, type Permission } from "./audio.js";
-import { displayLanguage, getCatalogModel, LANGUAGE_DETECTION_MODEL } from "./catalog.js";
-import { autoLanguagePolicy } from "./language-detection-policy.js";
 import { chineseOutputSummary, isChineseLanguage } from "./chinese.js";
 import {
   chooseLanguages,
-  createTranscriptionLanguagePicker,
+  chooseTranscriptionLanguage,
   transcriptionLanguageSummary,
-} from "./model-picker.js";
+} from "./language-picker.js";
+import { chooseAsrModel } from "./model-picker.js";
 import {
   chooseMicrophone,
   microphonesEqual,
   microphoneSummary,
 } from "./microphone-picker.js";
-import { runModelSelection } from "./onboarding.js";
 import {
   settingsWithPreferredLanguages,
   writeSettings,
@@ -46,6 +49,7 @@ type SettingsAction =
   | "model"
   | "transcription-language"
   | "chinese-output"
+  | "api-key"
   | "microphone"
   | "shortcut";
 
@@ -56,7 +60,13 @@ type SettingsHomeChoice = SingleSelectChoice<SettingsAction> & {
 };
 
 function preferredLanguagesSummary(languages: readonly string[]): string {
-  const names = languages.map(displayLanguage);
+  const names = languages.map((language) => {
+    try {
+      return new Intl.DisplayNames(["en"], { type: "language" }).of(language) ?? language;
+    } catch {
+      return language;
+    }
+  });
   const visible = names.slice(0, 3).join(", ");
   return names.length > 3 ? `${visible} +${names.length - 3}` : visible;
 }
@@ -85,52 +95,30 @@ async function saveUpdatedSettings(
   }
 }
 
-let detectorDownload: Promise<void> | undefined;
-
-/**
- * Fetch the language detector in the background; until it lands, Auto detect
- * transcribes as `fallback`.
- */
-function downloadLanguageDetector(ctx: ExtensionContext, fallback: string): void {
-  if (detectorDownload) return;
-  ctx.ui.notify("Downloading language detector…", "info");
-  detectorDownload = downloadCatalogModel(LANGUAGE_DETECTION_MODEL)
-    .then(
-      () => ctx.ui.notify("Language detector downloaded. Auto detect is ready.", "info"),
-      (error: unknown) => ctx.ui.notify(
-        `Couldn't download the language detector (${error instanceof Error ? error.message : String(error)}). ` +
-        `Auto detect will use ${displayLanguage(fallback)} until it's downloaded. ` +
-        "Choose Auto detect again to retry the download.",
-        "error",
-      ),
-    )
-    .catch(() => undefined) // The session may be gone by the time it settles.
-    .finally(() => { detectorDownload = undefined; });
-}
-
 function settingsHomeChoices(
   configured: TranscribeSettings,
   permission: Permission,
 ): SettingsHomeChoice[] {
-  const model = getCatalogModel(configured.model.id)!;
+  const key = asrApiKey();
+  const custom = customAsrBaseUrl();
   const choices: SettingsHomeChoice[] = [
     {
       value: "preferred-languages",
       label: "Preferred languages",
       summary: preferredLanguagesSummary(configured.preferredLanguages),
-      description: "Languages you speak, used to rank and recommend transcription models",
+      description: "Languages you speak, used to pick transcription defaults",
     },
     {
       value: "model",
       label: "Model",
-      summary: model.name,
-      description: "Switch between downloaded models, or download a new one",
+      summary: configured.model,
+      description: "Model name sent to the OpenAI-compatible transcription endpoint",
     },
     {
       value: "transcription-language",
+      summary: transcriptionLanguageSummary(configured.transcriptionLanguage),
       label: "Transcription language",
-      summary: transcriptionLanguageSummary(configured.transcriptionLanguage, model),
-      description: "Language expected in recordings, or automatic detection when supported",
+      description: "Language expected in recordings, or automatic detection",
     },
   ];
 
@@ -147,6 +135,17 @@ function settingsHomeChoices(
   }
 
   choices.push(
+    {
+      value: "api-key",
+      label: "API key",
+      summary: key ? "✓ set" : custom ? "✓ custom endpoint" : "✗ not set",
+      description: key
+        ? "Read from the environment at every request"
+        : custom
+          ? `No key sent to ${custom}`
+          : "Set PI_VOICE_ASR_API_KEY (or OPENAI_API_KEY), or PI_VOICE_ASR_BASE_URL for a local server",
+      ...(!key && !custom ? { alert: true } : {}),
+    },
     {
       value: "microphone",
       label: "Microphone",
@@ -248,25 +247,6 @@ async function chooseChineseOutput(
   );
 }
 
-async function chooseTranscriptionLanguage(
-  ctx: ExtensionContext,
-  configured: TranscribeSettings,
-): Promise<TranscriptionLanguage | undefined> {
-  const model = getCatalogModel(configured.model.id)!;
-  return ctx.ui.custom<TranscriptionLanguage | undefined>(
-    (tui, theme, keybindings, done) =>
-      createTranscriptionLanguagePicker(
-        tui,
-        theme,
-        keybindings,
-        model,
-        configured.transcriptionLanguage,
-        configured.preferredLanguages,
-        done,
-      ),
-  );
-}
-
 async function chooseShortcut(
   ctx: ExtensionContext,
   current: string,
@@ -343,39 +323,27 @@ export async function showSettingsMenu(
     }
 
     if (action === "model") {
-      const updated = await runModelSelection(ctx, {
-        shortcut: configured.shortcut,
-        preferredLanguages: configured.preferredLanguages,
-        transcriptionLanguage: configured.transcriptionLanguage,
-        chineseOutput: configured.chineseOutput,
-        currentModelId: configured.model.id,
-        microphone: configured.microphone,
-        voiceActivityDetection: configured.voiceActivityDetection,
-        longformChunking: configured.longformChunking,
-        postActivation: "stay",
-        onPreferredLanguagesChange: async (preferredLanguages) => {
-          if (languagesEqual(preferredLanguages, configured.preferredLanguages)) return;
-          const next = settingsWithPreferredLanguages(configured, preferredLanguages);
-          await writeSettings(next);
-          Object.assign(configured, next);
-          ctx.ui.notify("Preferred languages saved", "info");
-        },
-      });
-      if (updated) Object.assign(configured, updated);
+      const model = await chooseAsrModel(ctx, configured.model);
+      if (!model || model === configured.model) continue;
+      await saveUpdatedSettings(
+        ctx,
+        configured,
+        { ...configured, model },
+        `Model saved as ${model}`,
+      );
       continue;
     }
 
     if (action === "transcription-language") {
-      const transcriptionLanguage = await chooseTranscriptionLanguage(ctx, configured);
-      if (!transcriptionLanguage) continue;
-      const model = getCatalogModel(configured.model.id)!;
-      // Auto needs the detector on disk; choosing Auto again retries a failure.
-      const policy = autoLanguagePolicy(model, configured.preferredLanguages);
-      if (transcriptionLanguage === "auto" && policy.kind === "detect" && pendingDownloads(model, true).length) {
-        downloadLanguageDetector(ctx, policy.languages[0]!);
+      const transcriptionLanguage = await chooseTranscriptionLanguage(
+        ctx,
+        configured.transcriptionLanguage,
+        configured.preferredLanguages,
+      );
+      if (!transcriptionLanguage || transcriptionLanguage === configured.transcriptionLanguage) {
+        continue;
       }
-      if (transcriptionLanguage === configured.transcriptionLanguage) continue;
-      const summary = transcriptionLanguageSummary(transcriptionLanguage, model);
+      const summary = transcriptionLanguageSummary(transcriptionLanguage);
       await saveUpdatedSettings(
         ctx,
         configured,
@@ -395,6 +363,11 @@ export async function showSettingsMenu(
         { ...configured, chineseOutput },
         `Chinese output saved as ${summary}`,
       );
+      continue;
+    }
+
+    if (action === "api-key") {
+      ctx.ui.notify(apiKeyStatusMessage(), hasAsrCredentials() ? "info" : "error");
       continue;
     }
 

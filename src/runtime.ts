@@ -5,7 +5,7 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { getKeybindings } from "@earendil-works/pi-tui";
-import { existsSync } from "node:fs";
+import { hasAsrCredentials, missingApiKeyMessage } from "./asr-client.js";
 import { CAPTURE_SAMPLE_RATE } from "./audio-constants.js";
 import { isMacOSPermissionDenied } from "./audio-errors.js";
 import { logStep, watchEventLoop } from "./log.js";
@@ -15,7 +15,6 @@ import { requestReadyAfterReload, takeReadyRequest } from "./ready-handoff.js";
 import type { TranscribeSettings } from "./settings.js";
 import { displayShortcut } from "./shortcut-core.js";
 import { TranscriptionService } from "./transcription-service.js";
-import { VoiceActivityDetection } from "./vad.js";
 import type { RecordingMeter } from "./visualizer.js";
 
 type ActiveRecording = {
@@ -50,7 +49,7 @@ function captureErrorMessage(error: unknown): string {
 
 function transcriptionErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
-  return `Local transcription failed: ${message}`;
+  return `Transcription failed: ${message}`;
 }
 
 export function createPiVoiceRuntime(
@@ -69,8 +68,7 @@ export function createPiVoiceRuntime(
   let settingsWarningShown = false;
   let audioModulePromise: Promise<typeof import("./audio.js")> | undefined;
   let visualizerModulePromise: Promise<typeof import("./visualizer.js")> | undefined;
-  const voiceActivity = new VoiceActivityDetection();
-  const transcriptionService = new TranscriptionService(undefined, (pcm, signal) => voiceActivity.scoreClip(pcm, signal));
+  const transcriptionService = new TranscriptionService();
 
   function loadAudio(): Promise<typeof import("./audio.js")> {
     return (audioModulePromise ??= import("./audio.js"));
@@ -102,7 +100,7 @@ export function createPiVoiceRuntime(
       ? `run /reload, then ${displayShortcut(shortcut)} to talk`
       : `${displayShortcut(shortcut)} to talk`;
     const command = "/voice-settings";
-    const commandDescription = "to change settings and download new models";
+    const commandDescription = "to review languages, model, and microphone";
     const summary = `${command} ${commandDescription}`;
 
     // The TUI renders a success-colored widget in the meter slot so the user
@@ -138,27 +136,6 @@ export function createPiVoiceRuntime(
     return configured;
   }
 
-  async function configureModel(
-    ctx: ExtensionContext,
-    previous: TranscribeSettings,
-  ): Promise<TranscribeSettings | undefined> {
-    const { runModelSelection } = await import("./onboarding.js");
-    const configured = await runModelSelection(ctx, {
-      shortcut: previous.shortcut,
-      preferredLanguages: previous.preferredLanguages,
-      transcriptionLanguage: previous.transcriptionLanguage,
-      chineseOutput: previous.chineseOutput,
-      currentModelId: previous.model.id,
-      microphone: previous.microphone,
-      voiceActivityDetection: previous.voiceActivityDetection,
-      longformChunking: previous.longformChunking,
-      postActivation: "advance",
-    });
-    if (configured) rememberSettings(configured);
-    return configured;
-  }
-
-  // `setUp`: setup ran and finished; the caller shows Ready since only it knows if a reload follows.
   async function ensureSettings(
     ctx: ExtensionContext,
   ): Promise<{ configured?: TranscribeSettings; setUp: boolean; completedFirstRun: boolean }> {
@@ -168,26 +145,14 @@ export function createPiVoiceRuntime(
       ctx.ui.notify(settingsReadWarning, "warning");
     }
 
-    if (settings && existsSync(settings.model.path)) {
+    if (settings) {
       return { configured: settings, setUp: false, completedFirstRun: false };
     }
-
-    const previous = settings;
-    if (settings) {
-      ctx.ui.notify(
-        `Configured model file is missing: ${settings.model.path}. Choose a model again; nothing will be downloaded without confirmation.`,
-        "warning",
-      );
-      settings = undefined;
-    }
-
-    const configured = previous
-      ? await configureModel(ctx, previous)
-      : await configureFirstRun(ctx);
+    const configured = await configureFirstRun(ctx);
     return {
       configured,
       setUp: configured !== undefined,
-      completedFirstRun: previous === undefined && configured !== undefined,
+      completedFirstRun: configured !== undefined,
     };
   }
 
@@ -195,17 +160,17 @@ export function createPiVoiceRuntime(
     await loadSettingsOnce();
     if (settingsReadWarning && !settings) {
       throw new Error(
-        `${settingsReadWarning} Ask the user to run /voice-settings in Pi's interactive TUI to configure a local model, then retry transcribe_file.`,
+        `${settingsReadWarning} Ask the user to run /voice-settings in Pi's interactive TUI, then retry transcribe_file.`,
       );
     }
     if (!settings) {
       throw new Error(
-        "Pi Voice is not configured. Ask the user to run /voice-settings in Pi's interactive TUI once to choose and download a local model, then retry transcribe_file.",
+        "Pi Voice is not configured. Ask the user to run /voice-settings in Pi's interactive TUI once, then retry transcribe_file.",
       );
     }
-    if (!existsSync(settings.model.path)) {
+    if (!hasAsrCredentials()) {
       throw new Error(
-        `The configured transcription model is missing: ${settings.model.path}. Ask the user to run /voice-settings and choose a model again, then retry transcribe_file.`,
+        `${missingApiKeyMessage()} Ask the user to set the key or endpoint (for example in their shell profile) and retry transcribe_file.`,
       );
     }
     return settings;
@@ -300,7 +265,6 @@ export function createPiVoiceRuntime(
     try {
       const result = await active.dictation.stop();
       if (shuttingDown) return;
-      if (result?.warning) ctx.ui.notify(result.warning, "warning");
       if (!result) {
         await reportDictationError(ctx, active.dictation);
       } else if (result.text) {
@@ -359,10 +323,9 @@ export function createPiVoiceRuntime(
       openCapture: openMicrophone,
       onAudio: (chunk) => meter.push(chunk),
       onChange: updateMeter,
-      createSpeechFilter: (settings, onSpeech) => voiceActivity.createFilter(settings, onSpeech),
     });
     function updateMeter(): void {
-      meter.update({ modelState: controller.modelState, microphoneStopped: controller.interruption !== undefined });
+      meter.update({ microphoneStopped: controller.interruption !== undefined });
     }
     dictation = controller;
     try {
@@ -408,12 +371,10 @@ export function createPiVoiceRuntime(
 
     // First-press module loading and microphone initialization take a
     // noticeable moment; show feedback until the recording meter takes over.
-    // Static text on the shared widget slot: an animated spinner repaints every
-    // frame, and the meter replaces plain lines without a component swap.
     const { clearTranscribeWidget, showTranscribeStatus } = await loadVisualizer();
     logStep("loading settings");
     await loadSettingsOnce();
-    if (settings && existsSync(settings.model.path)) {
+    if (settings) {
       showTranscribeStatus(ctx, "Starting microphone…");
     } else {
       // Setup panes replace only the editor, so a status line set here or by
@@ -423,6 +384,11 @@ export function createPiVoiceRuntime(
 
     const { configured, setUp, completedFirstRun } = await ensureSettings(ctx);
     if (configured && setUp) await notifyReady(ctx, configured.shortcut);
+    if (configured && !hasAsrCredentials()) {
+      clearTranscribeWidget(ctx);
+      ctx.ui.notify(missingApiKeyMessage(), "error");
+      return;
+    }
     if (configured && !completedFirstRun) await startRecording(ctx, configured);
     // The meter shares the widget slot and has replaced the spinner when
     // recording began; clear the spinner only when recording never started.
@@ -536,8 +502,6 @@ export function createPiVoiceRuntime(
       operation?.catch(() => undefined),
       transcriptionService.shutdown().catch(() => undefined),
     ]);
-    // After the dictation, so no recording still holds a VAD session.
-    await voiceActivity.dispose().catch(() => undefined);
     recording = undefined;
     dictation = undefined;
     if (visualizerModulePromise) {

@@ -12,7 +12,7 @@ export function readShortcutForRegistration(): string {
   for (const path of [settingsPath(), legacySettingsPath()]) {
     try {
       const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-      if (!isObject(parsed) || parsed.version !== 1 || typeof parsed.shortcut !== "string") {
+      if (!isObject(parsed) || typeof parsed.shortcut !== "string") {
         return defaultShortcut();
       }
       return normalizeShortcut(parsed.shortcut) ?? defaultShortcut();

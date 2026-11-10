@@ -24,7 +24,6 @@ type FileTranscriptionDetails = {
   seconds: number;
   truncation?: TruncationResult;
   fullTranscriptPath?: string;
-  warning?: string;
 };
 
 type FileTranscriptionOptions = {
@@ -84,13 +83,16 @@ export function registerFileTranscriptionTool(
   pi.registerTool({
     name: "transcribe_file",
     label: "Transcribe File",
-    description: `Transcribe speech from a local audio or video file using Pi Voice's configured local model. Requires the ffmpeg executable on PATH (or PI_VOICE_FFMPEG_PATH). Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}; a complete transcript is saved to a temporary file when needed.`,
-    promptSnippet: "Transcribe speech from local audio or video files with a local model",
+    description: `Transcribe speech from a local audio or video file using Pi Voice's configured remote model. Requires the ffmpeg executable on PATH (or PI_VOICE_FFMPEG_PATH). Output is truncated to ${DEFAULT_MAX_LINES} lines or ${formatSize(DEFAULT_MAX_BYTES)}; a complete transcript is saved to a temporary file when needed.`,
+    promptSnippet: "Transcribe speech from local audio or video files with a remote model",
     promptGuidelines: [
       "Use transcribe_file when speech in a local audio or video file needs to be read, analyzed, or transcribed.",
-      "transcribe_file automatically queues model work, with interactive dictation taking priority over queued files.",
+      "transcribe_file decodes audio with FFmpeg and sends it to the OpenAI-compatible transcription endpoint configured in Pi Voice; long files are split into sequential requests.",
       "If transcribe_file reports that FFmpeg is unavailable, explain the installation guidance and ask the user before running a system package-manager command.",
     ],
+    // Truthful capability hints for permission systems: the tool only reads
+    // a local file and sends audio to the configured endpoint.
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: true },
     parameters: Type.Object({
       path: Type.String({
         description: "Local media file path, absolute or relative to the current working directory",
@@ -121,7 +123,7 @@ export function registerFileTranscriptionTool(
           if (fileOperations.saturated) {
             onUpdate?.({
               content: [{ type: "text", text: "Waiting for file transcription capacity…" }],
-              details: { inputPath, modelId: configured.model.id, seconds: 0 },
+              details: { inputPath, modelId: configured.model, seconds: 0 },
             });
           }
 
@@ -129,13 +131,13 @@ export function registerFileTranscriptionTool(
             if (fileDecoders.saturated) {
               onUpdate?.({
                 content: [{ type: "text", text: `Waiting to decode ${basename(inputPath)}…` }],
-                details: { inputPath, modelId: configured.model.id, seconds: 0 },
+                details: { inputPath, modelId: configured.model, seconds: 0 },
               });
             }
             const audio = await fileDecoders.run(async () => {
               onUpdate?.({
                 content: [{ type: "text", text: `Decoding ${basename(inputPath)} with FFmpeg…` }],
-                details: { inputPath, modelId: configured.model.id, seconds: 0 },
+                details: { inputPath, modelId: configured.model, seconds: 0 },
               });
               const { decodeFileAudio } = await import("./file-audio.js");
               return decodeFileAudio(inputPath, operationSignal);
@@ -145,34 +147,32 @@ export function registerFileTranscriptionTool(
               content: [
                 {
                   type: "text",
-                  text: `Queued ${audio.seconds.toFixed(1)}s from ${basename(inputPath)} for local transcription…`,
+                  text: `Queued ${audio.seconds.toFixed(1)}s from ${basename(inputPath)} for transcription…`,
                 },
               ],
               details: {
                 inputPath,
-                modelId: configured.model.id,
+                modelId: configured.model,
                 seconds: audio.seconds,
               },
             });
-            const { text: transcript, warning } = await service.transcribeFile(
+            const { text: transcript } = await service.transcribe(
               configured,
               audio.pcm,
               operationSignal,
             );
             const details: FileTranscriptionDetails = {
               inputPath,
-              modelId: configured.model.id,
+              modelId: configured.model,
               seconds: audio.seconds,
-              ...(warning ? { warning } : {}),
             };
-            const warningText = warning ? `\n\n[Language detection: ${warning}]` : "";
 
             if (!transcript) {
               return {
                 content: [
                   {
                     type: "text" as const,
-                    text: `No speech detected in ${audio.seconds.toFixed(1)}s of audio from ${inputPath}${warningText}`,
+                    text: `No speech detected in ${audio.seconds.toFixed(1)}s of audio from ${inputPath}`,
                   },
                 ],
                 details,
@@ -196,7 +196,7 @@ export function registerFileTranscriptionTool(
             }
 
             return {
-              content: [{ type: "text" as const, text: resultText + warningText }],
+              content: [{ type: "text" as const, text: resultText }],
               details,
             };
           }, operationSignal);

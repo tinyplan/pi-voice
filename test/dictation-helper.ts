@@ -1,6 +1,7 @@
-import { Deferred } from "../src/deferred.js";
+import { Deferred } from "./helpers.js";
 import type { Capture, CapturedAudio, CaptureSinks, OpenCapture } from "../src/dictation-controller.js";
-import type { DictationReservation, Transcript } from "../src/transcription-service.js";
+import type { TranscribeSettings } from "../src/settings.js";
+import type { Transcript } from "../src/transcription-service.js";
 
 /** One recording on a FakeMicrophone. */
 export class FakeCapture implements Capture {
@@ -23,46 +24,32 @@ export class FakeMicrophone {
   opens = 0;
   openError: Error | undefined;
   openGate: Deferred<void> | undefined;
-  /** Delivered while opening, before open resolves, as a device may. */
-  audioDuringOpen: Float32Array[] = [];
   readonly open: OpenCapture = async (_microphone, sinks) => {
     this.opens++;
     await this.openGate?.promise;
     if (this.openError) throw this.openError;
-    for (const chunk of this.audioDuringOpen) sinks.onAudio(chunk);
     const capture = new FakeCapture(sinks);
     this.captures.push(capture);
     return capture;
   };
 }
 
-export class FakeReservation implements DictationReservation {
-  readonly prepared = new Deferred();
-  readonly ready = this.prepared.promise;
-  readonly result = new Deferred<string>();
-  readonly chunks: Float32Array[] = [];
-  cancelled = 0;
-  submissions = 0;
-  pcm: Float32Array | undefined;
-  signal: AbortSignal | undefined;
-  feed(chunk: Float32Array): void { this.chunks.push(chunk); }
-  submit(pcm: Float32Array, signal?: AbortSignal): Promise<Transcript> {
-    this.submissions++;
-    this.pcm = pcm;
-    this.signal = signal;
-    return this.result.promise.then((text) => ({ text }));
-  }
-  cancel(): void { if (!this.submissions) this.cancelled++; }
-}
+/** A transcription service stand-in that records submits and settles them by hand. */
+export class FakeTranscriptionService {
+  readonly calls: {
+    settings: TranscribeSettings;
+    pcm: Float32Array;
+    signal: AbortSignal | undefined;
+    result: Deferred<Transcript>;
+  }[] = [];
 
-export function fakeDictationService() {
-  const reservations: FakeReservation[] = [];
-  return {
-    reservations,
-    reserveDictation() {
-      const reservation = new FakeReservation();
-      reservations.push(reservation);
-      return reservation;
-    },
-  };
+  transcribe(settings: TranscribeSettings, pcm: Float32Array, signal?: AbortSignal): Promise<Transcript> {
+    const result = new Deferred<Transcript>();
+    this.calls.push({ settings, pcm, signal, result });
+    return result.promise;
+  }
+
+  get pending() {
+    return this.calls.at(-1);
+  }
 }

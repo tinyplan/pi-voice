@@ -6,7 +6,6 @@ import {
   type Focusable,
   fuzzyFilter,
   Input,
-  Loader,
   Spacer,
   Text,
   truncateToWidth,
@@ -14,8 +13,6 @@ import {
   type KeybindingsManager,
   type TUI,
 } from "@earendil-works/pi-tui";
-import { formatBinarySize } from "./catalog.js";
-import type { DownloadState } from "./model-selection-controller.js";
 import { VoiceKeys } from "./keybindings.js";
 
 type UiTheme = ExtensionContext["ui"]["theme"];
@@ -124,54 +121,6 @@ export function padToWidth(value: string, width: number): string {
 /** Shared fixed-width marker: the arrow is focus, while ✓ is selected/current. */
 export function selectionMarker(theme: UiTheme, selected: boolean): string {
   return selected ? theme.fg("accent", "✓") : " ";
-}
-
-/** Shared download presentation; the picker owns and disposes its spinner. */
-export class DownloadPanel {
-  private readonly spinner: Loader;
-  private state: DownloadState;
-  private stats: string | undefined;
-
-  constructor(
-    tui: TUI,
-    private readonly theme: UiTheme,
-    private readonly keys: VoiceKeys,
-    state: DownloadState,
-  ) {
-    this.state = state;
-    this.spinner = new Loader(tui, (text) => theme.fg("accent", text), (text) => theme.fg("muted", text), state.message);
-  }
-
-  update(state: DownloadState, stats?: string): void {
-    this.state = state;
-    this.stats = stats;
-    this.spinner.setMessage(state.message);
-  }
-
-  render(width: number, maxRows = Infinity): string[] {
-    const { model, downloaded, total } = this.state;
-    const text = (value: string) => new Text(value, PANEL_PADDING, 0).render(width);
-    const ratio = total > 0 ? Math.max(0, Math.min(1, downloaded / total)) : 0;
-    const barWidth = Math.max(1, Math.min(36, width - PANEL_PADDING * 2 - 5));
-    const filled = Math.round(ratio * barWidth);
-    const bar = this.theme.fg("accent", "█".repeat(filled)) + this.theme.fg("dim", "─".repeat(barWidth - filled));
-    const title = this.theme.fg("accent", this.theme.bold(`Downloading ${model.name}`));
-    const progress = `${bar}${total > 0 ? this.theme.fg("dim", ` ${Math.floor(ratio * 100)}%`) : ""}`;
-    const stats = this.theme.fg("muted", this.stats ?? (total > 0
-      ? `${formatBinarySize(downloaded)} / ${formatBinarySize(total)}` : "Preparing download…"));
-    const privacy = this.theme.fg("dim", "Models run locally — audio never leaves this machine.");
-    const hint = this.keys.hint("tui.select.cancel", "stop (keeps progress)");
-    const activity = this.spinner.render(width);
-    const lines = ["", ...text(title), ...activity, "", ...text(progress), "", ...text(stats), ...text(privacy), "", ...text(hint)];
-    if (lines.length <= maxRows) return lines;
-    // Small terminals keep the current operation and cancel key visible.
-    const compact = [title, activity[1]?.trim() ?? this.state.message, progress, stats, privacy]
-      .slice(0, Math.max(0, maxRows - 1));
-    return [...compact, this.keys.hint("tui.select.cancel", "stop")].map((line) => truncateToWidth(` ${line}`, width));
-  }
-
-  invalidate(): void { this.spinner.invalidate(); }
-  dispose(): void { this.spinner.stop(); }
 }
 
 /** Pi-native single-choice picker with optional fuzzy search and current-value marker. */
@@ -429,4 +378,89 @@ export class SingleSelectPicker<T extends string> extends Container implements F
       this.refresh();
     }
   }
+}
+
+export type TextInputOptions = {
+  title: string;
+  subtitle?: string;
+  initial?: string;
+  /** Hint under the input; defaults to the trimmed value's use. */
+  placeholder?: string;
+  cancelLabel?: string;
+  confirmLabel?: string;
+};
+
+/** One-line text entry pane: Enter accepts a non-empty trimmed value, Esc cancels. */
+export class TextInputPrompt extends Container implements Focusable {
+  private readonly input = new Input();
+  private readonly footer = new Text("", PANEL_PADDING, 0);
+  private readonly keys: VoiceKeys;
+  private _focused = false;
+
+  get focused(): boolean {
+    return this._focused;
+  }
+
+  set focused(value: boolean) {
+    this._focused = value;
+    this.input.focused = value;
+  }
+
+  constructor(
+    private readonly tui: TUI,
+    private readonly theme: UiTheme,
+    keybindings: KeybindingsManager,
+    private readonly options: TextInputOptions,
+    private readonly done: (value: string | undefined) => void,
+  ) {
+    super();
+    this.keys = new VoiceKeys(keybindings);
+    this.input.setValue(options.initial ?? "");
+
+    this.addChild(panelBorder(theme));
+    this.addChild(new Spacer(1));
+    this.addChild(new Text(theme.fg("accent", theme.bold(options.title)), PANEL_PADDING, 0));
+    if (options.subtitle) {
+      this.addChild(new Text(theme.fg("muted", options.subtitle), PANEL_PADDING, 0));
+    }
+    this.addChild(new Spacer(1));
+    const box = new Box(LIST_PADDING, 0);
+    box.addChild(this.input);
+    this.addChild(box);
+    this.addChild(new Spacer(1));
+    if (options.placeholder) {
+      this.addChild(new Text(theme.fg("dim", options.placeholder), PANEL_PADDING, 0));
+      this.addChild(new Spacer(1));
+    }
+    this.addChild(this.footer);
+    this.addChild(new Spacer(1));
+    this.addChild(panelBorder(theme));
+    this.footer.setText(
+      `${this.keys.hint("tui.select.confirm", options.confirmLabel ?? "save")}  ${this.keys.hint("tui.select.cancel", options.cancelLabel ?? "back")}`,
+    );
+    this.tui.requestRender();
+  }
+
+  handleInput(data: string): void {
+    if (this.keys.matches(data, "tui.select.confirm")) {
+      const value = this.input.getValue().trim();
+      if (value) this.done(value);
+      return;
+    }
+    if (this.keys.matches(data, "tui.select.cancel")) {
+      this.done(undefined);
+      return;
+    }
+    this.input.handleInput(data);
+    this.tui.requestRender();
+  }
+}
+
+export async function promptText(
+  ctx: ExtensionContext,
+  options: TextInputOptions,
+): Promise<string | undefined> {
+  return ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) =>
+    new TextInputPrompt(tui, theme, keybindings, options, done),
+  );
 }

@@ -4,13 +4,13 @@ import test from "node:test";
 
 // Two startup boundaries must stay cheap. index.ts (extension load) defers
 // the runtime itself to the first shortcut press, and runtime.ts defers the
-// native recorder, transcribe-cpp, and the TUI until they are actually used.
-// This walks the compiled JS, where type-only imports are already erased and
-// dynamic import() calls never match the static `from`/`import "…"` pattern.
-const NATIVE_OR_TUI = ["audio", "transcription", "visualizer", "file-audio"];
+// native recorder and the TUI until they are actually used. This walks the
+// compiled JS, where type-only imports are already erased and dynamic
+// import() calls never match the static `from`/`import "…"` pattern.
+const DEFERRED_MODULES = ["audio", "visualizer", "file-audio"];
 const BOUNDARIES: Record<string, string[]> = {
-  index: ["runtime", ...NATIVE_OR_TUI],
-  runtime: [...NATIVE_OR_TUI, "models"],
+  index: ["runtime", ...DEFERRED_MODULES],
+  runtime: [...DEFERRED_MODULES],
 };
 
 function staticImports(module: string): string[] {

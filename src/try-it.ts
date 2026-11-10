@@ -9,27 +9,24 @@ import {
 import { microphonePermission, openMicrophone } from "./audio.js";
 import { isMacOSPermissionDenied } from "./audio-errors.js";
 import { markKeyPress, watchEventLoop } from "./log.js";
-import { getCatalogModel } from "./catalog.js";
 import { DictationController, type DictationControllerOptions } from "./dictation-controller.js";
 import { microphoneSummary } from "./microphone-picker.js";
 import { matchesShortcut, VoiceKeys } from "./keybindings.js";
-import { COMFORTABLE_REAL_TIME_FACTOR } from "./recommendations.js";
 import type { TranscribeSettings } from "./settings.js";
 import { displayShortcut } from "./shortcut-core.js";
 import { TranscriptionService } from "./transcription-service.js";
 import { TranscriptPreview } from "./transcript-preview.js";
-import { VoiceActivityDetection } from "./vad.js";
-import { editorBorder, onboardingHeader, PANEL_PADDING, panelBorder, paneRowBudget } from "./ui-components.js";
 import {
   formatTranscriptionSummary,
   METER_UPDATE_MS,
   renderMeterLine,
   SpectrumAnalyzer,
 } from "./visualizer.js";
+import { editorBorder, onboardingHeader, PANEL_PADDING, panelBorder, paneRowBudget } from "./ui-components.js";
 
 type UiTheme = ExtensionContext["ui"]["theme"];
 
-type TryItPaneOptions = Pick<DictationControllerOptions, "openCapture" | "now" | "createSpeechFilter"> & {
+type TryItPaneOptions = Pick<DictationControllerOptions, "openCapture" | "now"> & {
   /** Shown only before the first recording attempt when macOS has not asked yet. */
   showMacPermissionNote?: boolean;
 };
@@ -41,21 +38,7 @@ export type TryItResult =
   | { action: "microphone" }
   | { action: "model" };
 
-/** Shorter takes are dominated by fixed costs and say little about speed. */
-const MIN_SPEECH_SECONDS_TO_JUDGE = 5;
-
-export function realTimeFactor(speechSeconds: number, transcribeSeconds: number): number {
-  return speechSeconds / Math.max(transcribeSeconds, 0.05);
-}
-
-export function needsFasterModel(speechSeconds: number, transcribeSeconds: number): boolean {
-  return (
-    speechSeconds >= MIN_SPEECH_SECONDS_TO_JUDGE &&
-    realTimeFactor(speechSeconds, transcribeSeconds) < COMFORTABLE_REAL_TIME_FACTOR
-  );
-}
-
-/** Presentation and navigation only; native resources belong to the controller. */
+/** Presentation and navigation only; recording resources belong to the controller. */
 export class TryItPane implements Component {
   private readonly dictation: DictationController;
   private readonly analyzer = new SpectrumAnalyzer();
@@ -65,8 +48,7 @@ export class TryItPane implements Component {
   private disposed = false;
   private closed = false;
   private showMacPermissionNote: boolean;
-  private modelPreparationScheduled = false;
-  /** Onboarding loads models in the background; watch the loop while it's up. */
+  /** Onboarding may still be loading modules; watch the loop while it's up. */
   private readonly unwatch = watchEventLoop();
 
   constructor(
@@ -74,7 +56,7 @@ export class TryItPane implements Component {
     private readonly theme: UiTheme,
     keybindings: KeybindingsManager,
     private readonly settings: TranscribeSettings,
-    service: Pick<TranscriptionService, "reserveDictation">,
+    service: Pick<TranscriptionService, "transcribe">,
     private readonly done: (result: TryItResult) => void,
     options: TryItPaneOptions = { openCapture: openMicrophone },
   ) {
@@ -84,7 +66,6 @@ export class TryItPane implements Component {
     this.dictation = new DictationController(service, {
       openCapture: options.openCapture,
       now: options.now,
-      createSpeechFilter: options.createSpeechFilter,
       onChange: () => this.refresh(),
       onAudio: (chunk) => {
         this.analyzer.push(chunk);
@@ -106,19 +87,9 @@ export class TryItPane implements Component {
   }
 
   render(width: number): string[] {
-    // The native backend performs some synchronous first-use initialization.
-    // Start it only after this first render has put Try It on screen, so the
-    // model picker never looks stuck while the next model is being prepared.
-    if (!this.modelPreparationScheduled) {
-      this.modelPreparationScheduled = true;
-      setImmediate(() => {
-        if (!this.closed && !this.disposed) this.dictation.prepare(this.settings);
-      });
-    }
-
     const state = this.dictation.state;
     const shortcut = displayShortcut(this.settings.shortcut);
-    const modelName = getCatalogModel(this.settings.model.id)?.name ?? this.settings.model.id;
+    const modelName = this.settings.model;
     const title = "Try it";
     const fg = (color: Parameters<UiTheme["fg"]>[0], text: string) => this.theme.fg(color, text);
     const text = (value: string) => new Text(value, PANEL_PADDING, 0).render(width);
@@ -129,16 +100,10 @@ export class TryItPane implements Component {
     if (state.phase === "listening") {
       activity = renderMeterLine(this.theme, {
         bands: this.analyzer.bands, elapsedMs: this.dictation.elapsedMs,
-        modelState: this.dictation.modelState,
         microphoneStopped: this.dictation.interruption !== undefined,
       });
-    } else if (
-      (state.phase === "idle" || state.phase === "ready") &&
-      this.dictation.modelState === "loading"
-    ) {
-      activity = fg("muted", `Loading ${modelName}… You can start recording now.`);
     } else if (state.phase === "transcribing") {
-      activity = fg("accent", "Transcribing…");
+      activity = fg("accent", `Transcribing with ${modelName}…`);
     } else if (state.phase === "starting") {
       activity = fg("muted", "Starting microphone…");
     } else if (state.phase === "cancelling") {
@@ -149,15 +114,9 @@ export class TryItPane implements Component {
       activity = fg("muted", formatTranscriptionSummary(speechSeconds, transcribeSeconds));
       if (interruption) {
         details = fg("warning", `The microphone stopped after ${speechSeconds.toFixed(1)}s: ${interruption.message}`);
-      } else if (needsFasterModel(speechSeconds, transcribeSeconds)) {
-        details = fg("warning", `Slow on this machine? Press ${this.keys.keyText("voice.tryIt.model")} to try another model.`);
-      }
-      if (state.result.warning) {
-        const warning = fg("warning", state.result.warning);
-        details = details ? `${details}\n${warning}` : warning;
       }
     } else if (state.phase === "error") {
-      activity = fg("error", state.stage === "model" ? "Could not load the model" : state.stage === "capture" ? "Microphone capture failed" : "Transcription failed");
+      activity = fg("error", state.stage === "capture" ? "Microphone capture failed" : "Transcription failed");
       const message = state.cause instanceof Error ? state.cause.message : String(state.cause);
       details = fg("error", message);
       if (state.stage === "capture" && isMacOSPermissionDenied(state.cause)) {
@@ -308,20 +267,17 @@ export class TryItPane implements Component {
 }
 
 export async function tryVoice(ctx: ExtensionContext, settings: TranscribeSettings): Promise<TryItResult | undefined> {
-  const voiceActivity = new VoiceActivityDetection();
-  const service = new TranscriptionService(undefined, (pcm, signal) => voiceActivity.scoreClip(pcm, signal));
+  const service = new TranscriptionService();
   let pane: TryItPane | undefined;
   try {
     return await ctx.ui.custom<TryItResult>((tui, theme, keybindings, done) =>
       (pane = new TryItPane(tui, theme, keybindings, settings, service, done, {
         openCapture: openMicrophone,
-        createSpeechFilter: (configured, onSpeech) => voiceActivity.createFilter(configured, onSpeech),
         showMacPermissionNote: process.platform === "darwin" && microphonePermission() === "not-determined",
       })),
     );
   } finally {
     await pane?.dispose();
     await service.shutdown();
-    await voiceActivity.dispose();
   }
 }

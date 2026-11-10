@@ -1,15 +1,10 @@
 import { readFile, rename, unlink, writeFile } from "node:fs/promises";
-import {
-  languageIdentity,
-  getCatalogModel,
-  resolveModelLanguage,
-  type CatalogModel,
-} from "./catalog.js";
-import { autoLanguagePolicy } from "./language-detection-policy.js";
+import { defaultShortcut } from "./default-shortcut.js";
+import { languageIdentity } from "./languages.js";
 import { normalizeShortcut } from "./shortcut-core.js";
 import { legacySettingsPath, settingsPath } from "./settings-path.js";
 
-const SETTINGS_VERSION = 1;
+const SETTINGS_VERSION = 2;
 
 export type MicrophoneSetting =
   | { type: "system-default" }
@@ -27,26 +22,21 @@ function defaultChineseOutput(): ChineseOutput {
   return "simplified";
 }
 
-/** "auto" uses native detection or the external detector; otherwise a language code. */
+/** "auto" asks the service to detect the language; otherwise an ISO language code. */
 export type TranscriptionLanguage = string;
 
+/** The model name sent to the transcription API. */
+export const DEFAULT_MODEL = "whisper-1";
+
 export type TranscribeSettings = {
-  version: 1;
-  backend: { type: "transcribe-cpp" };
+  version: 2;
+  backend: { type: "openai-asr" };
   shortcut: string;
   preferredLanguages: string[];
   transcriptionLanguage: TranscriptionLanguage;
   chineseOutput: ChineseOutput;
   microphone: MicrophoneSetting;
-  /** Transcribe only the speech in a recording, not its silence and noise. */
-  voiceActivityDetection: boolean;
-  /** Hidden, settings.json only: false decodes long audio in one piece, without voice activity cuts. */
-  longformChunking: boolean;
-  model: {
-    source: "catalog";
-    id: string;
-    path: string;
-  };
+  model: string;
 };
 
 type SettingsReadResult = {
@@ -89,87 +79,74 @@ function validateMicrophone(value: unknown): MicrophoneSetting | undefined {
   return { type: "device", name: value.name, occurrence: value.occurrence as number };
 }
 
-function defaultTranscriptionLanguage(
-  model: CatalogModel,
-  preferredLanguages: readonly string[] = [],
-): TranscriptionLanguage {
-  if (autoLanguagePolicy(model, preferredLanguages).kind !== "unsupported") return "auto";
-  for (const language of preferredLanguages) {
-    const code = resolveModelLanguage(model, language);
-    if (code) return code;
-  }
-  return model.languages[0] ?? "en";
-}
-
-/** Keep an exact model language when possible; otherwise choose a safe default. */
-export function transcriptionLanguageForModel(
-  value: unknown,
-  model: CatalogModel,
-  preferredLanguages: readonly string[] = [],
-): TranscriptionLanguage {
-  if (typeof value === "string") {
-    if (value === "auto" && autoLanguagePolicy(model, preferredLanguages).kind !== "unsupported") {
-      return value;
-    }
-    if (value !== "auto") {
-      const code = resolveModelLanguage(model, value);
-      if (code) return code;
-    }
-  }
-  return defaultTranscriptionLanguage(model, preferredLanguages);
-}
-
 function validateSettings(value: unknown): TranscribeSettings | undefined {
   if (!isObject(value) || value.version !== SETTINGS_VERSION) return undefined;
-  if (!isObject(value.backend) || value.backend.type !== "transcribe-cpp") return undefined;
+  if (!isObject(value.backend) || value.backend.type !== "openai-asr") return undefined;
   const shortcut =
     typeof value.shortcut === "string" ? normalizeShortcut(value.shortcut) : undefined;
   if (!shortcut) return undefined;
-  if (!isObject(value.model) || value.model.source !== "catalog") return undefined;
-  if (typeof value.model.id !== "string") return undefined;
-  const model = getCatalogModel(value.model.id);
-  if (!model) return undefined;
-  if (typeof value.model.path !== "string" || value.model.path.length === 0) return undefined;
-
+  if (typeof value.model !== "string" || !value.model.trim()) return undefined;
   const preferredLanguages = normalizeLanguages(value.preferredLanguages);
   const microphone = validateMicrophone(value.microphone);
   if (!preferredLanguages || !microphone) return undefined;
+  if (typeof value.transcriptionLanguage !== "string" || !value.transcriptionLanguage.trim()) {
+    return undefined;
+  }
 
   return {
     version: SETTINGS_VERSION,
-    backend: { type: "transcribe-cpp" },
+    backend: { type: "openai-asr" },
     shortcut,
     preferredLanguages,
-    transcriptionLanguage: transcriptionLanguageForModel(
-      value.transcriptionLanguage,
-      model,
-      preferredLanguages,
-    ),
+    transcriptionLanguage: value.transcriptionLanguage.trim().toLowerCase(),
     chineseOutput: validateChineseOutput(value.chineseOutput),
     microphone,
-    voiceActivityDetection: value.voiceActivityDetection !== false,
-    longformChunking: value.longformChunking !== false,
-    model: {
-      source: "catalog",
-      id: value.model.id,
-      path: value.model.path,
-    },
+    model: value.model.trim(),
+  };
+}
+
+/** Portable fields of a local-model settings file, for the remote rewrite. */
+function migrateLocalSettings(value: unknown): Partial<TranscribeSettings> | undefined {
+  if (!isObject(value) || value.version !== 1) return undefined;
+  const preferredLanguages = normalizeLanguages(value.preferredLanguages);
+  const microphone = validateMicrophone(value.microphone);
+  const chineseOutput =
+    typeof value.chineseOutput === "string" ? validateChineseOutput(value.chineseOutput) : undefined;
+  const transcriptionLanguage = typeof value.transcriptionLanguage === "string" && value.transcriptionLanguage.trim()
+    ? value.transcriptionLanguage.trim().toLowerCase()
+    : undefined;
+  return {
+    ...(preferredLanguages ? { preferredLanguages } : {}),
+    ...(microphone ? { microphone } : {}),
+    ...(chineseOutput ? { chineseOutput } : {}),
+    ...(transcriptionLanguage ? { transcriptionLanguage } : {}),
   };
 }
 
 async function readSettingsFile(path: string): Promise<SettingsReadResult> {
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
-    const settings = validateSettings(parsed);
-    return settings
-      ? { settings }
-      : { warning: `Invalid settings in ${path}; configuration is required.` };
+    parsed = JSON.parse(await readFile(path, "utf8"));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
     return {
       warning: `Could not read ${path}: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
+
+  const settings = validateSettings(parsed);
+  if (settings) return { settings };
+
+  // Pi Voice 0.2 and earlier ran local models. Carry over what still applies
+  // and finish setup with the remote backend's defaults.
+  const migrated = migrateLocalSettings(parsed);
+  if (migrated) {
+    const shortcut = isObject(parsed) && typeof parsed.shortcut === "string"
+      ? normalizeShortcut(parsed.shortcut)
+      : undefined;
+    return { settings: createSettings({ shortcut: shortcut ?? defaultShortcut(), ...migrated }) };
+  }
+  return { warning: `Invalid settings in ${path}; configuration is required.` };
 }
 
 export async function readSettings(): Promise<SettingsReadResult> {
@@ -209,48 +186,39 @@ export async function writeSettings(settings: TranscribeSettings): Promise<void>
   }
 }
 
-type ModelSettingsOptions = {
+type CreateSettingsOptions = {
   shortcut: string;
   preferredLanguages?: readonly string[];
+  model?: string;
   transcriptionLanguage?: TranscriptionLanguage;
   chineseOutput?: ChineseOutput;
   microphone?: MicrophoneSetting;
-  voiceActivityDetection?: boolean;
-  longformChunking?: boolean;
 };
 
-export function settingsForModel(
-  modelId: string,
-  modelPath: string,
-  options: ModelSettingsOptions,
-): TranscribeSettings {
-  const model = getCatalogModel(modelId);
-  if (!model) throw new Error(`Unknown catalog model: ${modelId}`);
+export function createSettings(options: CreateSettingsOptions): TranscribeSettings {
   const preferredLanguages = [
     ...new Set((options.preferredLanguages ?? ["en"]).map(languageIdentity)),
-  ];
+  ].filter(Boolean);
   return {
     version: SETTINGS_VERSION,
-    backend: { type: "transcribe-cpp" },
+    backend: { type: "openai-asr" },
     shortcut: options.shortcut,
     preferredLanguages,
-    transcriptionLanguage: transcriptionLanguageForModel(
-      options.transcriptionLanguage,
-      model,
-      preferredLanguages,
-    ),
+    transcriptionLanguage: options.transcriptionLanguage === undefined
+      ? "auto"
+      : options.transcriptionLanguage.trim().toLowerCase(),
     chineseOutput: options.chineseOutput ?? defaultChineseOutput(),
     microphone: { ...(options.microphone ?? DEFAULT_MICROPHONE) },
-    voiceActivityDetection: options.voiceActivityDetection ?? true,
-    longformChunking: options.longformChunking ?? true,
-    model: { source: "catalog", id: modelId, path: modelPath },
+    model: options.model ?? DEFAULT_MODEL,
   };
 }
 
-/** Preference edits re-resolve the language, so Auto never outlives support for it. */
 export function settingsWithPreferredLanguages(
   current: TranscribeSettings,
   preferredLanguages: readonly string[],
 ): TranscribeSettings {
-  return settingsForModel(current.model.id, current.model.path, { ...current, preferredLanguages });
+  return {
+    ...current,
+    preferredLanguages: [...new Set(preferredLanguages.map(languageIdentity))].filter(Boolean),
+  };
 }

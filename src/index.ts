@@ -4,6 +4,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { existsSync } from "node:fs";
+import { hasAsrCredentials } from "./asr-client.js";
 import { registerFileTranscriptionTool } from "./file-transcription.js";
 import {
   claimLegacyGitNotice,
@@ -64,8 +65,9 @@ export default function piVoice(pi: ExtensionAPI): void {
       !existsSync(settingsPath()) &&
       !existsSync(legacySettingsPath())
     ) {
+      const keyHint = hasAsrCredentials() ? "" : " · set PI_VOICE_ASR_API_KEY to enable transcription";
       ctx.ui.notify(
-        `Pi Voice installed · press ${displayShortcut(registeredShortcut)} or run /voice-settings to set up`,
+        `Pi Voice installed · press ${displayShortcut(registeredShortcut)} or run /voice-settings to set up${keyHint}`,
         "info",
       );
     }

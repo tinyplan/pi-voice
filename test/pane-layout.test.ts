@@ -2,62 +2,29 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type Component } from "@earendil-works/pi-tui";
-import { CATALOG_MODELS } from "../src/catalog.js";
+import { VoiceKeys } from "../src/keybindings.js";
 import {
-  CatalogModelPicker,
   createTranscriptionLanguagePicker,
   LanguagePicker,
-} from "../src/model-picker.js";
-import { ModelRatingsHelp } from "../src/model-ratings-help.js";
-import { VoiceKeys } from "../src/keybindings.js";
-import { RecommendedModelPicker } from "../src/recommendation-picker.js";
-import type { TranscribeSettings } from "../src/settings.js";
+} from "../src/language-picker.js";
+import { createSettings } from "../src/settings.js";
 import { TryItPane } from "../src/try-it.js";
-import { SingleSelectPicker } from "../src/ui-components.js";
-import { isolatedModelCache } from "./model-cache-helper.js";
+import { SingleSelectPicker, TextInputPrompt } from "../src/ui-components.js";
 import { keybindings, testTheme, testTui } from "./ui-helpers.js";
 
 initTheme("dark");
 const DOWN = "\x1b[B";
-const settings: TranscribeSettings = {
-  version: 1,
-  backend: { type: "transcribe-cpp" },
-  shortcut: "ctrl+alt+z",
-  preferredLanguages: ["en"],
-  transcriptionLanguage: "en",
-  chineseOutput: "simplified",
-  microphone: { type: "system-default" },
-  voiceActivityDetection: true,
-  longformChunking: true,
-  model: {
-    source: "catalog",
-    id: "parakeet-unified-en-0.6b",
-    path: "/tmp/model.gguf",
-  },
-};
+const settings = createSettings({ shortcut: "ctrl+alt+z", model: "whisper-1" });
 
 type TestPane = Component & {
   handleInput?: (data: string) => void;
   dispose?: () => unknown;
 };
 
-test("editor-mounted panes respect the shared 80x24 row and width budget", async (t) => {
-  isolatedModelCache(t);
+test("editor-mounted panes respect the shared 80x24 row and width budget", async () => {
   const makeTui = () => testTui(24);
-  const pendingActivation = () => new Promise<{ path: string }>(() => {});
-  const pendingService = {
-    reserveDictation: () => ({
-      ready: new Promise<void>(() => {}),
-      feed() {},
-      submit: async () => "",
-      cancel() {},
-    }),
-  };
-  const recommended = [{
-    model: CATALOG_MODELS[0]!,
-    roles: ["best" as const],
-    status: "eligible" as const,
-  }];
+  const pendingTranscribe = () => new Promise<{ text: string }>(() => {});
+  const pendingService = { transcribe: pendingTranscribe };
   const choices = Array.from({ length: 30 }, (_, index) => ({
     value: `choice-${index}`,
     label: `Choice ${index}`,
@@ -65,23 +32,6 @@ test("editor-mounted panes respect the shared 80x24 row and width budget", async
   }));
 
   const factories: [string, () => TestPane][] = [
-    ["catalog models", () => new CatalogModelPicker(
-      makeTui(), testTheme(), keybindings(), ["en"], undefined, () => {}, pendingActivation,
-    )],
-    ["recommendations", () => new RecommendedModelPicker(
-      makeTui(),
-      testTheme(),
-      keybindings(),
-      ["en"],
-      [
-        recommended[0]!,
-        { ...recommended[0]!, model: { ...recommended[0]!.model, id: "fast" }, roles: ["fast"] },
-        { ...recommended[0]!, model: { ...recommended[0]!.model, id: "accurate" }, roles: ["accurate"] },
-      ],
-      pendingActivation,
-      () => {},
-      { expanded: true },
-    )],
     ["languages", () => new LanguagePicker(
       makeTui(), testTheme(), keybindings(), ["en"], "back", () => {},
     )],
@@ -89,23 +39,22 @@ test("editor-mounted panes respect the shared 80x24 row and width budget", async
       makeTui(),
       testTheme(),
       keybindings(),
-      CATALOG_MODELS.find((model) => model.capabilities.languageDetection && model.languages.length > 20)!,
       "auto",
-      ["en"],
+      ["en", "zh"],
       () => {},
     )],
     ["single select", () => new SingleSelectPicker(
       makeTui(), testTheme(), keybindings(), choices, choices[0]!.value,
       { title: "Choose one", searchable: true }, () => {},
     )],
-    ["Try It", () => new TryItPane(
-      makeTui(), testTheme(), keybindings(), settings, pendingService as never, () => {},
+    ["text input", () => new TextInputPrompt(
+      makeTui(), testTheme(), keybindings(),
+      { title: "Custom model name", subtitle: "The model string your endpoint expects." },
+      () => {},
     )],
-    ["ratings help", () => {
-      const help = new ModelRatingsHelp(makeTui(), testTheme(), new VoiceKeys(keybindings()), true);
-      help.open();
-      return help;
-    }],
+    ["Try It", () => new TryItPane(
+      makeTui(), testTheme(), keybindings(), settings, pendingService, () => {},
+    )],
   ];
 
   for (const [name, factory] of factories) {
@@ -121,4 +70,10 @@ test("editor-mounted panes respect the shared 80x24 row and width budget", async
     }
     await pane.dispose?.();
   }
+});
+
+test("a plain keys instance still routes voice bindings", () => {
+  const keys = new VoiceKeys(keybindings());
+  assert.equal(keys.matches(" ", "voice.languages.toggle"), true);
+  assert.equal(keys.matches("\t", "voice.languages.continue"), true);
 });

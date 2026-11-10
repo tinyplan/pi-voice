@@ -1,494 +1,187 @@
+import { test } from "node:test";
 import assert from "node:assert/strict";
-import test from "node:test";
-import type { TranscribeSettings } from "../src/settings.js";
-import { TranscriptionService } from "../src/transcription-service.js";
-import type {
-  DictationStream,
-  TranscriptionOptions,
-} from "../src/transcription.js";
-import { deferred, nextTurn } from "./helpers.js";
+import { CAPTURE_SAMPLE_RATE } from "../src/audio-constants.js";
+import type { AsrTranscribeOptions } from "../src/asr-client.js";
+import { createSettings } from "../src/settings.js";
+import {
+  chunkCuts,
+  joinTranscripts,
+  maxRequestSeconds,
+  quietCutNear,
+  TranscriptionService,
+} from "../src/transcription-service.js";
+import { Deferred } from "./helpers.js";
+import { nextTurn } from "./helpers.js";
 
-const text = async (transcript: Promise<{ text: string }>) => (await transcript).text;
+const settings = createSettings({ shortcut: "ctrl+alt+z", model: "whisper-1" });
 
-// A streaming catalog model with native detection: takes use the backend stream, not chunking.
-function settings(modelPath: string, modelId = "nemotron-3.5-asr-streaming-0.6b"): TranscribeSettings {
-  return {
-    version: 1,
-    backend: { type: "transcribe-cpp" },
+function fakeClient() {
+  const calls: { pcm: Float32Array; options: AsrTranscribeOptions; result: Deferred<string> }[] = [];
+  const client = {
+    // Like fetch, an aborted signal rejects the in-flight request.
+    async transcribe(pcm: Float32Array, options: AsrTranscribeOptions): Promise<string> {
+      const result = new Deferred<string>();
+      const onAbort = (): void =>
+        result.reject(options.signal?.reason ?? new Error("aborted"));
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+      if (options.signal?.aborted) onAbort();
+      calls.push({ pcm, options, result });
+      return result.promise.finally(() =>
+        options.signal?.removeEventListener("abort", onAbort));
+    },
+  };
+  return { calls, client };
+}
+
+test("short audio is one request carrying the model and language settings", async () => {
+  const { calls, client } = fakeClient();
+  const service = new TranscriptionService(client);
+  const chinese = createSettings({
     shortcut: "ctrl+alt+z",
-    preferredLanguages: ["en"],
-    transcriptionLanguage: "auto",
+    model: "whisper-1",
+    preferredLanguages: ["zh"],
+    transcriptionLanguage: "zh",
     chineseOutput: "simplified",
-    microphone: { type: "system-default" },
-    voiceActivityDetection: true,
-    longformChunking: true,
-    model: { source: "catalog", id: modelId, path: modelPath },
-  };
-}
-
-function pcm(id: number): Float32Array {
-  return Float32Array.of(id);
-}
-
-type TestBackend = {
-  prepare(): Promise<void>;
-  startStream?(
-    options?: TranscriptionOptions,
-  ): Promise<DictationStream | undefined>;
-  transcribe(
-    samples: Float32Array,
-    options?: TranscriptionOptions,
-  ): Promise<string>;
-  dispose(): Promise<void>;
-};
-
-function createTestService(
-  overrides: Partial<TestBackend> = {},
-): TranscriptionService {
-  return new TranscriptionService(() => ({
-    async prepare() {},
-    async transcribe(samples) {
-      return String(samples[0] ?? -1);
-    },
-    async dispose() {},
-    ...overrides,
-  }));
-}
-
-function createTestStream(
-  overrides: Partial<DictationStream> = {},
-): DictationStream {
-  return {
-    async feed() {},
-    async finalize() {
-      return "streamed";
-    },
-    reset() {},
-    ...overrides,
-  };
-}
-
-function createHarness(blockedIds: readonly number[] = []): {
-  service: TranscriptionService;
-  events: string[];
-  release(id: number): void;
-} {
-  const events: string[] = [];
-  const blocks = new Map(blockedIds.map((id) => [id, deferred()]));
-  const service = new TranscriptionService((modelPath) => {
-    events.push(`load:${modelPath}`);
-    return {
-      async prepare() {
-        events.push(`prepare:${modelPath}`);
-      },
-      async transcribe(samples: Float32Array, options: TranscriptionOptions = {}) {
-        const id = samples[0] ?? -1;
-        events.push(`run:${id}`);
-        await blocks.get(id)?.promise;
-        options.signal?.throwIfAborted();
-        events.push(`done:${id}`);
-        return String(id);
-      },
-      async dispose() {
-        events.push(`unload:${modelPath}`);
-      },
-    };
   });
-  return {
-    service,
-    events,
-    release(id) {
-      blocks.get(id)?.resolve();
-    },
-  };
-}
-
-test("queued jobs sharing a model load it once", async () => {
-  const harness = createHarness([1]);
-  const first = text(harness.service.transcribeFile(settings("model-a"), pcm(1)));
-  await nextTurn();
-  const second = text(harness.service.transcribeFile(settings("model-a"), pcm(2)));
-
-  harness.release(1);
-  assert.deepEqual(await Promise.all([first, second]), ["1", "2"]);
-  await nextTurn();
-
-  assert.equal(harness.events.filter((event) => event === "load:model-a").length, 1);
-  assert.deepEqual(
-    harness.events.filter((event) => event.startsWith("run:")),
-    ["run:1", "run:2"],
-  );
-  assert.equal(harness.events.at(-1), "unload:model-a");
-  await harness.service.shutdown();
-});
-
-test("dictation reservation runs before queued file jobs", async () => {
-  const harness = createHarness([1]);
-  const activeFile = text(harness.service.transcribeFile(settings("model-a"), pcm(1)));
-  await nextTurn();
-  const queuedFile = text(harness.service.transcribeFile(settings("model-a"), pcm(2)));
-  const reservation = harness.service.reserveDictation(settings("model-a"));
-
-  harness.release(1);
-  await reservation.ready;
-  const dictation = text(reservation.submit(pcm(9)));
-  assert.deepEqual(
-    await Promise.all([activeFile, dictation, queuedFile]),
-    ["1", "9", "2"],
-  );
-  await nextTurn();
-
-  assert.deepEqual(
-    harness.events.filter((event) => event.startsWith("run:")),
-    ["run:1", "run:9", "run:2"],
-  );
-  assert.equal(harness.events.filter((event) => event === "load:model-a").length, 1);
-  assert.equal(harness.events.at(-1), "unload:model-a");
-  await harness.service.shutdown();
-});
-
-test("cancelling a dictation reservation releases file work", async () => {
-  const harness = createHarness();
-  const reservation = harness.service.reserveDictation(settings("model-a"));
-  await reservation.ready;
-  const file = text(harness.service.transcribeFile(settings("model-a"), pcm(3)));
-  await nextTurn();
-
-  assert.equal(harness.events.includes("run:3"), false);
-  reservation.cancel();
-  assert.equal(await file, "3");
-  await harness.service.shutdown();
-});
-
-test("a new reservation can be made after cancelling during model preparation", async () => {
-  const prepareGate = deferred();
-  const service = createTestService({
-    async prepare() {
-      await prepareGate.promise;
-    },
-  });
-
-  const first = service.reserveDictation(settings("model-a"));
-  first.cancel();
-  let second!: ReturnType<TranscriptionService["reserveDictation"]>;
-  assert.doesNotThrow(() => {
-    second = service.reserveDictation(settings("model-a"));
-  });
-
-  prepareGate.resolve();
-  second.cancel();
+  const promise = service.transcribe(chinese, Float32Array.of(0.1));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.options.model, "whisper-1");
+  assert.equal(calls[0]!.options.language, "zh");
+  assert.equal(calls[0]!.options.chineseEnabled, true);
+  assert.equal(calls[0]!.options.chineseOutput, "simplified");
+  calls[0]!.result.resolve("你好");
+  assert.deepEqual(await promise, { text: "你好" });
   await service.shutdown();
 });
 
-test("aborting a submission during model preparation releases its slot", async () => {
-  const prepareGate = deferred();
-  const service = createTestService({
-    async prepare() {
-      await prepareGate.promise;
-    },
-  });
-
-  const controller = new AbortController();
-  const first = service.reserveDictation(settings("model-a"));
-  const result = text(first.submit(pcm(1), controller.signal));
-  controller.abort(new Error("cancelled while loading"));
-  let second!: ReturnType<TranscriptionService["reserveDictation"]>;
-  assert.doesNotThrow(() => {
-    second = service.reserveDictation(settings("model-a"));
-  });
-
-  prepareGate.resolve();
-  await assert.rejects(result, /cancelled while loading/);
-  second.cancel();
+test("auto language is sent as an absent language", async () => {
+  const { calls, client } = fakeClient();
+  const service = new TranscriptionService(client);
+  const promise = service.transcribe(settings, Float32Array.of(0.1));
+  assert.equal(calls[0]!.options.language, undefined);
+  calls[0]!.result.resolve("hi");
+  assert.deepEqual(await promise, { text: "hi" });
   await service.shutdown();
 });
 
-test("aborting an unstarted queued submission rejects immediately", async () => {
-  const harness = createHarness([1]);
-  const activeFile = text(harness.service.transcribeFile(settings("model-a"), pcm(1)));
-  await nextTurn();
-
-  const controller = new AbortController();
-  const reservation = harness.service.reserveDictation(settings("model-a"));
-  const result = text(reservation.submit(pcm(9), controller.signal));
-  controller.abort(new Error("cancelled while queued"));
-
-  let timeout: NodeJS.Timeout | undefined;
-  const settled = await Promise.race([
-    result.then(
-      () => "resolved",
-      () => "rejected",
-    ),
-    new Promise<"timeout">((resolve) => {
-      timeout = setTimeout(() => resolve("timeout"), 100);
-    }),
-  ]);
-  if (timeout) clearTimeout(timeout);
-  assert.equal(settled, "rejected");
-  await assert.rejects(result, /cancelled while queued/);
-
-  harness.release(1);
-  assert.equal(await activeFile, "1");
-  assert.equal(harness.events.includes("run:9"), false);
-  await harness.service.shutdown();
+test("long audio is cut at quiet points and joined", async () => {
+  const { calls, client } = fakeClient();
+  const service = new TranscriptionService(client);
+  // 25 minutes: quiet everywhere except a loud tail forcing a hard cut later.
+  const samples = 25 * 60 * CAPTURE_SAMPLE_RATE;
+  const pcm = new Float32Array(samples);
+  pcm.fill(0.5, samples - CAPTURE_SAMPLE_RATE * 30);
+  const cuts = chunkCuts(pcm);
+  assert.ok(cuts.length > 1, "the clip spans several requests");
+  const promise = service.transcribe(settings, pcm);
+  const texts: string[] = [];
+  for (let index = 0; index < cuts.length; index += 1) {
+    await nextTurn();
+    assert.ok(calls.length === index + 1, `request ${index + 1} of ${cuts.length} was sent`);
+    const expected = index === 0 ? 0 : cuts[index - 1]!;
+    assert.equal(calls[index]!.pcm.length, cuts[index]! - expected);
+    texts.push(`part ${index + 1}`);
+    calls[index]!.result.resolve(texts[index]!);
+  }
+  assert.deepEqual(await promise, { text: texts.join(" ") });
+  await service.shutdown();
 });
 
-test("a submitted reservation is queued when a replacement is admitted", async () => {
-  const harness = createHarness([1]);
-  const activeFile = text(harness.service.transcribeFile(settings("model-a"), pcm(1)));
-  await nextTurn();
-
-  const first = harness.service.reserveDictation(settings("model-a"));
-  const firstResult = text(first.submit(pcm(9)));
-  let second!: ReturnType<TranscriptionService["reserveDictation"]>;
-  assert.doesNotThrow(() => {
-    second = harness.service.reserveDictation(settings("model-a"));
-  });
-  second.cancel();
-
-  harness.release(1);
-  assert.deepEqual(await Promise.all([activeFile, firstResult]), ["1", "9"]);
-  assert.deepEqual(
-    harness.events.filter((event) => event.startsWith("run:")),
-    ["run:1", "run:9"],
-  );
-  await harness.service.shutdown();
-});
-
-test("a different model is unloaded and loaded at the queue boundary", async () => {
-  const harness = createHarness([4]);
-  const first = text(harness.service.transcribeFile(settings("model-a"), pcm(4)));
-  await nextTurn();
-  const second = text(harness.service.transcribeFile(settings("model-b"), pcm(5)));
-
-  harness.release(4);
-  await Promise.all([first, second]);
-  await nextTurn();
-
+test("chunk cuts never exceed the request cap and prefer silence", () => {
+  const max = 10 * CAPTURE_SAMPLE_RATE;
+  const pcm = new Float32Array(25 * CAPTURE_SAMPLE_RATE);
+  // Loud speech, one quiet second around the eight-minute mark.
+  pcm.fill(0.8);
+  pcm.fill(0, 8 * CAPTURE_SAMPLE_RATE, 9 * CAPTURE_SAMPLE_RATE);
+  const cuts = chunkCuts(pcm, max, CAPTURE_SAMPLE_RATE);
+  assert.deepEqual(cuts.at(-1)!, pcm.length);
+  for (let index = 0; index < cuts.length; index += 1) {
+    const start = index === 0 ? 0 : cuts[index - 1]!;
+    const length = cuts[index]! - start;
+    assert.ok(length <= max, `chunk ${index} is ${length / CAPTURE_SAMPLE_RATE}s`);
+  }
+  // The first cut lands inside the quiet second rather than the hard cap.
+  const quietStart = 8 * CAPTURE_SAMPLE_RATE;
   assert.ok(
-    harness.events.indexOf("unload:model-a") < harness.events.indexOf("load:model-b"),
+    cuts[0]! > quietStart && cuts[0]! <= 9 * CAPTURE_SAMPLE_RATE,
+    `first cut at ${(cuts[0]! / CAPTURE_SAMPLE_RATE).toFixed(1)}s`,
   );
-  assert.equal(harness.events.filter((event) => event === "load:model-a").length, 1);
-  assert.equal(harness.events.filter((event) => event === "load:model-b").length, 1);
-  await harness.service.shutdown();
 });
 
-test("a stream releases the model before the next batch run", async () => {
-  const events: string[] = [];
-  let streamActive = false;
-  const service = createTestService({
-    async startStream() {
-      assert.equal(streamActive, false);
-      streamActive = true;
-      events.push("stream:start");
-      return createTestStream({
-        async feed(samples) {
-          events.push(`feed:${samples[0] ?? -1}`);
-        },
-        async finalize() {
-          events.push("stream:finalize");
-          streamActive = false;
-          return "streamed";
-        },
-        reset() {
-          if (streamActive) events.push("stream:reset");
-          streamActive = false;
-        },
-      });
-    },
-    async transcribe(samples) {
-      assert.equal(streamActive, false, "batch transcription started with an active stream");
-      events.push(`batch:${samples[0] ?? -1}`);
-      return String(samples[0] ?? -1);
-    },
+test("quietCutNear returns the end of the quietest window", () => {
+  const pcm = new Float32Array(20 * CAPTURE_SAMPLE_RATE);
+  pcm.fill(0.9);
+  const quietStart = 10 * CAPTURE_SAMPLE_RATE;
+  pcm.fill(0, quietStart, quietStart + CAPTURE_SAMPLE_RATE / 2);
+  const cut = quietCutNear(pcm, 11 * CAPTURE_SAMPLE_RATE, CAPTURE_SAMPLE_RATE);
+  assert.ok(cut >= quietStart && cut <= quietStart + CAPTURE_SAMPLE_RATE / 2);
+});
+
+test("the per-request cap reads PI_VOICE_ASR_MAX_SECONDS with clamps", () => {
+  const env = (value?: string) => (value === undefined ? {} : { PI_VOICE_ASR_MAX_SECONDS: value });
+  assert.equal(maxRequestSeconds(env()), 600);
+  assert.equal(maxRequestSeconds(env("120")), 120);
+  assert.equal(maxRequestSeconds(env(" 90 ")), 90);
+  assert.equal(maxRequestSeconds(env("abc")), 600);
+  assert.equal(maxRequestSeconds(env("5")), 10, "clamped up to the minimum");
+  assert.equal(maxRequestSeconds(env("99999")), 3600, "clamped down to the limit");
+});
+
+test("the request cap follows PI_VOICE_ASR_MAX_SECONDS for long audio", async (t) => {
+  const previous = process.env.PI_VOICE_ASR_MAX_SECONDS;
+  process.env.PI_VOICE_ASR_MAX_SECONDS = "120";
+  t.after(() => {
+    if (previous === undefined) delete process.env.PI_VOICE_ASR_MAX_SECONDS;
+    else process.env.PI_VOICE_ASR_MAX_SECONDS = previous;
   });
-
-  const reservation = service.reserveDictation(settings("model-a"));
-  await reservation.ready;
-  reservation.feed(pcm(7));
-  const file = text(service.transcribeFile(settings("model-a"), pcm(3)));
-  const dictation = text(reservation.submit(pcm(9)));
-
-  assert.equal(await dictation, "streamed");
-  assert.equal(await file, "3");
-  assert.ok(events.indexOf("stream:finalize") < events.indexOf("batch:3"));
+  const { calls, client } = fakeClient();
+  const service = new TranscriptionService(client);
+  // Five minutes at a two-minute cap: at least three requests, none over the cap.
+  const pcm = new Float32Array(5 * 60 * CAPTURE_SAMPLE_RATE);
+  const cuts = chunkCuts(pcm, 120 * CAPTURE_SAMPLE_RATE);
+  assert.ok(cuts.length >= 3);
+  const promise = service.transcribe(settings, pcm);
+  for (let index = 0; index < cuts.length; index += 1) {
+    await nextTurn();
+    assert.ok(calls.length === index + 1);
+    assert.ok(calls[index]!.pcm.length <= 120 * CAPTURE_SAMPLE_RATE);
+    calls[index]!.result.resolve(`part ${index + 1}`);
+  }
+  assert.deepEqual(await promise, {
+    text: Array.from({ length: cuts.length }, (_, index) => `part ${index + 1}`).join(" "),
+  });
   await service.shutdown();
 });
 
-for (const failurePoint of ["feed", "finalize"] as const) {
-  test(`a ${failurePoint} failure resets the stream before batch fallback`, async () => {
-    const events: string[] = [];
-    let streamActive = false;
-    const service = createTestService({
-      async startStream() {
-        streamActive = true;
-        return createTestStream({
-          async feed() {
-            if (failurePoint !== "feed") return;
-            events.push("stream:feed-failed");
-            throw new Error("stream feed failed");
-          },
-          async finalize() {
-            if (failurePoint === "feed") {
-              throw new Error("failed stream must not be finalized");
-            }
-            events.push("stream:finalize-failed");
-            throw new Error("stream finalize failed");
-          },
-          reset() {
-            events.push("stream:reset");
-            streamActive = false;
-          },
-        });
-      },
-      async transcribe(samples) {
-        assert.equal(streamActive, false, "fallback started before stream reset");
-        events.push("batch:fallback");
-        return `fallback:${samples[0] ?? -1}`;
-      },
-    });
-
-    const reservation = service.reserveDictation(settings("model-a"));
-    await reservation.ready;
-    if (failurePoint === "feed") {
-      reservation.feed(pcm(7));
-      await nextTurn();
-    }
-    const result = await text(reservation.submit(pcm(9)));
-
-    assert.equal(result, "fallback:9");
-    assert.ok(events.indexOf("stream:reset") < events.indexOf("batch:fallback"));
-    await service.shutdown();
-  });
-}
-
-test("dictation submitted before model preparation uses the batch path", async () => {
-  const prepareGate = deferred();
-  let streamStarts = 0;
-  const service = createTestService({
-    async prepare() {
-      await prepareGate.promise;
-    },
-    async startStream() {
-      streamStarts += 1;
-      throw new Error("a late stream must not be opened");
-    },
-  });
-
-  const reservation = service.reserveDictation(settings("model-a"));
-  const result = text(reservation.submit(pcm(9)));
-  prepareGate.resolve();
-
-  assert.equal(await result, "9");
-  assert.equal(streamStarts, 0);
-  await service.shutdown();
+test("joined transcripts space unspaced scripts and drop empties", () => {
+  assert.equal(joinTranscripts(["Hello", "world"]), "Hello world");
+  assert.equal(joinTranscripts(["你好", "世界"]), "你好世界");
+  assert.equal(joinTranscripts(["Hello", "世界"]), "Hello世界");
+  assert.equal(joinTranscripts(["你好", "world"]), "你好world");
+  assert.equal(joinTranscripts(["", "Hello", ""]), "Hello");
+  assert.equal(joinTranscripts(["  spaced  ", "out  "]), "spaced out");
 });
 
-test("cancelling with an in-flight feed discards queued chunks and releases file work", async () => {
-  const feedGate = deferred();
-  const events: string[] = [];
-  let streamActive = false;
-  const service = createTestService({
-    async startStream() {
-      streamActive = true;
-      return createTestStream({
-        async feed(samples) {
-          events.push(`feed:${samples[0] ?? -1}`);
-          await feedGate.promise;
-        },
-        async finalize() {
-          throw new Error("cancelled stream must not be finalized");
-        },
-        reset() {
-          events.push("stream:reset");
-          streamActive = false;
-        },
-      });
-    },
-    async transcribe(samples) {
-      assert.equal(streamActive, false, "file work started before stream reset");
-      events.push(`batch:${samples[0] ?? -1}`);
-      return String(samples[0] ?? -1);
-    },
-  });
-
-  const reservation = service.reserveDictation(settings("model-a"));
-  await reservation.ready;
-  reservation.feed(pcm(1));
-  reservation.feed(pcm(2));
-  await nextTurn();
-  const file = text(service.transcribeFile(settings("model-a"), pcm(3)));
-  reservation.cancel();
-
-  assert.equal(await file, "3");
-  feedGate.resolve();
-  await nextTurn();
-  assert.deepEqual(events.filter((event) => event.startsWith("feed:")), ["feed:1"]);
-  assert.ok(events.indexOf("stream:reset") < events.indexOf("batch:3"));
+test("shutdown rejects new work and aborts an in-flight request", async () => {
+  const { calls, client } = fakeClient();
+  const service = new TranscriptionService(client);
+  const pcm = Float32Array.of(0.2);
+  const promise = service.transcribe(settings, pcm);
+  assert.equal(promise instanceof Promise, true);
   await service.shutdown();
+  assert.equal(calls[0]!.options.signal?.aborted, true);
+  calls[0]!.result.resolve("too late");
+  await assert.rejects(promise, /Pi Voice is shutting down/);
+  await assert.rejects(service.transcribe(settings, pcm), /Pi Voice is shutting down/);
 });
 
-test("a submission that lands while the stream opens uses the batch path", async () => {
-  const streamGate = deferred();
-  const events: string[] = [];
-  const service = createTestService({
-    async startStream() {
-      events.push("stream:start");
-      await streamGate.promise;
-      return createTestStream({
-        async feed() {
-          throw new Error("a late stream must not be fed");
-        },
-        async finalize() {
-          throw new Error("a late stream must not be finalized");
-        },
-        reset() {
-          events.push("stream:reset");
-        },
-      });
-    },
-    async transcribe(samples) {
-      events.push(`batch:${samples[0] ?? -1}`);
-      return String(samples[0] ?? -1);
-    },
-  });
-
-  const reservation = service.reserveDictation(settings("model-a"));
-  await nextTurn();
-  assert.deepEqual(events, ["stream:start"]);
-  reservation.feed(pcm(7));
-  const result = text(reservation.submit(pcm(9)));
-  streamGate.resolve();
-
-  assert.equal(await result, "9");
-  assert.deepEqual(events, ["stream:start", "stream:reset", "batch:9"]);
-  await service.shutdown();
-});
-
-test("an empty recording never reaches stream finalize", async () => {
-  const events: string[] = [];
-  const service = createTestService({
-    async startStream() {
-      events.push("stream:start");
-      return createTestStream({
-        async finalize() {
-          throw new Error("an unfed stream must not be finalized");
-        },
-        reset() {
-          events.push("stream:reset");
-        },
-      });
-    },
-    async transcribe(samples) {
-      events.push(`batch:${samples.length}`);
-      if (samples.length === 0) throw new Error("No audio samples were provided");
-      return "text";
-    },
-  });
-
-  const reservation = service.reserveDictation(settings("model-a"));
-  await reservation.ready;
-  await assert.rejects(text(reservation.submit(new Float32Array(0))), /No audio samples/);
-  assert.deepEqual(events, ["stream:start", "stream:reset", "batch:0"]);
+test("a caller's abort signal reaches the request", async () => {
+  const { calls, client } = fakeClient();
+  const service = new TranscriptionService(client);
+  const abort = new AbortController();
+  const promise = service.transcribe(settings, Float32Array.of(0.1), abort.signal);
+  abort.abort(new Error("user cancelled"));
+  await assert.rejects(promise, /user cancelled/);
+  assert.equal(calls[0]!.options.signal?.aborted, true);
   await service.shutdown();
 });
